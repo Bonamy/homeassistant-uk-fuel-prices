@@ -12,7 +12,7 @@ CONF_ORS_API_KEY = "ors_api_key"
 
 DEFAULT_RADIUS = 10
 DEFAULT_FUEL_TYPE = "E10"
-DEFAULT_SCAN_INTERVAL = 86400  # 24 hours (once a day)
+DEFAULT_SCAN_INTERVAL = 7200  # 2 hours
 
 FUEL_TYPES = {
     "E10": "Regular Unleaded (E10)",

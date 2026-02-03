@@ -58,8 +58,16 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except FuelFinderApiError as err:
             raise UpdateFailed(f"Error fetching fuel data: {err}") from err
 
+        _LOGGER.info(
+            "Processing data: %d raw stations, %d raw price records, fuel_type=%s",
+            len(stations_raw), len(prices_raw), self._fuel_type,
+        )
+
         # Build station lookup by node_id
         stations_by_id: dict[str, dict[str, Any]] = {}
+        skipped_closed = 0
+        skipped_no_location = 0
+        skipped_out_of_range = 0
         for station in stations_raw:
             node_id = station.get("node_id", "")
             if not node_id:
@@ -67,6 +75,7 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Skip closed stations
             if station.get("permanent_closure") or station.get("temporary_closure"):
+                skipped_closed += 1
                 continue
 
             location = station.get("location", {})
@@ -74,12 +83,15 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 lat = float(location.get("latitude", 0))
                 lon = float(location.get("longitude", 0))
             except (TypeError, ValueError):
+                skipped_no_location += 1
                 continue
             if lat == 0 or lon == 0:
+                skipped_no_location += 1
                 continue
 
             dist = haversine_miles(self._home_lat, self._home_lon, lat, lon)
             if dist > self._radius:
+                skipped_out_of_range += 1
                 continue
 
             brand = station.get("brand_name", "")
@@ -102,8 +114,16 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "distance_miles": round(dist, 1),
             }
 
+        _LOGGER.debug(
+            "Station filtering: %d in range, %d closed, %d no location, %d out of range",
+            len(stations_by_id), skipped_closed, skipped_no_location, skipped_out_of_range,
+        )
+
         # Match prices to nearby stations
         candidates: list[dict[str, Any]] = []
+        matched_stations = 0
+        no_fuel_type_count = 0
+        bad_price_count = 0
         for price_record in prices_raw:
             node_id = price_record.get("node_id", "")
             station = stations_by_id.get(node_id)
@@ -111,8 +131,10 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 continue
 
             # Find the price for our fuel type
+            found_fuel = False
             for fp in price_record.get("fuel_prices", []):
                 if fp.get("fuel_type") == self._fuel_type:
+                    found_fuel = True
                     raw_price = fp.get("price")
                     cleaned = clean_price(raw_price)
                     if cleaned is not None:
@@ -121,7 +143,17 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         entry["fuel_type"] = self._fuel_type
                         entry["last_update"] = fp.get("price_last_updated", "")
                         candidates.append(entry)
+                        matched_stations += 1
+                    else:
+                        bad_price_count += 1
+                        _LOGGER.debug(
+                            "Station %s (%s) had invalid %s price: %s",
+                            station.get("station_name"), node_id,
+                            self._fuel_type, raw_price,
+                        )
                     break
+            if not found_fuel and station:
+                no_fuel_type_count += 1
 
         # Sort by price, then distance as tiebreaker
         candidates.sort(key=lambda x: (x["price"], x["distance_miles"]))
@@ -146,10 +178,11 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if i < len(driving_dists) and driving_dists[i] is not None:
                     entry["driving_distance_miles"] = driving_dists[i]
 
-        _LOGGER.debug(
-            "Found %d stations within %s miles, top 3 cheapest selected",
-            len(candidates),
-            self._radius,
+        _LOGGER.info(
+            "Results for %s: %d stations with valid prices, %d no %s price, "
+            "%d invalid prices, top 3 cheapest selected",
+            self._fuel_type, matched_stations, no_fuel_type_count,
+            self._fuel_type, bad_price_count,
         )
         return {
             "top3": top3,

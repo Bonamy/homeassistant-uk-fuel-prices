@@ -79,81 +79,175 @@ class FuelFinderApi:
         self._access_token = token_data["access_token"]
         self._token_expiry = time.time() + token_data.get("expires_in", 3600)
 
-    async def _get(self, url: str, params: dict[str, Any] | None = None) -> Any:
-        """Make an authenticated GET request."""
-        await self._ensure_token()
+    async def _get(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        max_retries: int = 3,
+    ) -> Any:
+        """Make an authenticated GET request with retry logic.
 
-        headers = {"Authorization": f"Bearer {self._access_token}"}
-        try:
-            async with self._session.get(
-                url, headers=headers, params=params
-            ) as resp:
-                if resp.status == 401:
-                    # Token may have expired, retry once
-                    self._access_token = None
-                    await self._ensure_token()
-                    headers["Authorization"] = f"Bearer {self._access_token}"
-                    async with self._session.get(
-                        url, headers=headers, params=params
-                    ) as retry_resp:
-                        if retry_resp.status != 200:
-                            text = await retry_resp.text()
-                            raise FuelFinderApiError(
-                                f"API request failed ({retry_resp.status}): {text}"
-                            )
-                        return await retry_resp.json()
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise FuelFinderApiError(
-                        f"API request failed ({resp.status}): {text}"
+        Retries on transient errors (500, 502, 503, 504, timeouts) with
+        exponential backoff.  A 401 triggers a single token refresh.
+        """
+        retryable_statuses = {500, 502, 503, 504}
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_retries + 1):
+            await self._ensure_token()
+            headers = {"Authorization": f"Bearer {self._access_token}"}
+
+            try:
+                async with self._session.get(
+                    url, headers=headers, params=params
+                ) as resp:
+                    if resp.status == 401:
+                        # Token may have expired, refresh and retry
+                        _LOGGER.debug("Got 401, refreshing token (attempt %d)", attempt)
+                        self._access_token = None
+                        await self._ensure_token()
+                        headers["Authorization"] = f"Bearer {self._access_token}"
+                        async with self._session.get(
+                            url, headers=headers, params=params
+                        ) as retry_resp:
+                            if retry_resp.status != 200:
+                                text = await retry_resp.text()
+                                raise FuelFinderApiError(
+                                    f"API request failed after token refresh ({retry_resp.status}): {text}"
+                                )
+                            return await retry_resp.json()
+
+                    if resp.status in retryable_statuses:
+                        text = await resp.text()
+                        last_error = FuelFinderApiError(
+                            f"API returned {resp.status} (attempt {attempt}/{max_retries}): {text}"
+                        )
+                        _LOGGER.warning(
+                            "API returned %d for %s (attempt %d/%d), retrying...",
+                            resp.status, url, attempt, max_retries,
+                        )
+                        if attempt < max_retries:
+                            delay = 2 ** attempt  # 2s, 4s, 8s
+                            await asyncio.sleep(delay)
+                            continue
+                        raise last_error
+
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise FuelFinderApiError(
+                            f"API request failed ({resp.status}): {text}"
+                        )
+                    return await resp.json()
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                last_error = FuelFinderApiError(
+                    f"Connection error (attempt {attempt}/{max_retries}): {err}"
+                )
+                _LOGGER.warning(
+                    "Connection error for %s (attempt %d/%d): %s",
+                    url, attempt, max_retries, err,
+                )
+                if attempt < max_retries:
+                    delay = 2 ** attempt
+                    await asyncio.sleep(delay)
+                    continue
+                raise FuelFinderApiError(
+                    f"Connection failed after {max_retries} attempts: {err}"
+                ) from err
+
+        # Should not reach here, but just in case
+        raise last_error or FuelFinderApiError("Request failed after all retries")
+
+    async def _fetch_all_batches(
+        self, url: str, label: str
+    ) -> list[dict[str, Any]]:
+        """Fetch all records across paginated batches with error resilience.
+
+        Retries individual failed batches and continues fetching remaining
+        batches even if one fails. Includes a 2-second delay between batches
+        to respect the API rate limit of 30 req/min (1 concurrent request).
+        """
+        all_records: list[dict[str, Any]] = []
+        batch = 1
+        failed_batches: list[int] = []
+        consecutive_empty = 0
+
+        while True:
+            if batch > 1:
+                await asyncio.sleep(2)
+
+            try:
+                data = await self._get(url, {"batch-number": batch})
+                records = (
+                    data
+                    if isinstance(data, list)
+                    else data.get("results", data.get("data", []))
+                )
+
+                if not records:
+                    consecutive_empty += 1
+                    if consecutive_empty >= 2:
+                        # Two empty responses in a row means we're done
+                        break
+                    _LOGGER.debug(
+                        "%s batch %d returned empty, trying next batch", label, batch
                     )
-                return await resp.json()
-        except aiohttp.ClientError as err:
-            raise FuelFinderApiError(f"Connection error: {err}") from err
+                    batch += 1
+                    continue
+
+                consecutive_empty = 0
+                all_records.extend(records)
+                _LOGGER.debug(
+                    "%s batch %d: got %d records (total: %d)",
+                    label, batch, len(records), len(all_records),
+                )
+
+                if len(records) < BATCH_SIZE:
+                    break
+                batch += 1
+
+            except FuelFinderApiError as err:
+                failed_batches.append(batch)
+                _LOGGER.warning(
+                    "%s batch %d failed: %s — skipping to next batch",
+                    label, batch, err,
+                )
+                # Don't stop on a single batch failure; try the next one
+                # but cap at 2 consecutive failures to avoid infinite loops
+                if len(failed_batches) >= 2 and failed_batches[-1] == failed_batches[-2] + 1:
+                    _LOGGER.error(
+                        "%s: two consecutive batch failures (batches %d-%d), stopping",
+                        label, failed_batches[-2], failed_batches[-1],
+                    )
+                    break
+                batch += 1
+                continue
+
+        if failed_batches:
+            _LOGGER.warning(
+                "%s: completed with %d failed batches: %s (got %d records total)",
+                label, len(failed_batches), failed_batches, len(all_records),
+            )
+        else:
+            _LOGGER.debug(
+                "%s: fetched %d records across %d batches",
+                label, len(all_records), batch,
+            )
+
+        if not all_records and failed_batches:
+            raise FuelFinderApiError(
+                f"Failed to fetch any {label.lower()} — all batches failed"
+            )
+
+        return all_records
 
     async def fetch_all_stations(self) -> list[dict[str, Any]]:
-        """Fetch all station records across all batches.
-
-        Includes a 2-second delay between batches to respect the API rate
-        limit of 30 requests per minute (1 concurrent request).
-        """
-        all_stations: list[dict[str, Any]] = []
-        batch = 1
-        while True:
-            if batch > 1:
-                await asyncio.sleep(2)
-            data = await self._get(STATIONS_URL, {"batch-number": batch})
-            stations = data if isinstance(data, list) else data.get("results", data.get("data", []))
-            if not stations:
-                break
-            all_stations.extend(stations)
-            if len(stations) < BATCH_SIZE:
-                break
-            batch += 1
-        _LOGGER.debug("Fetched %d stations across %d batches", len(all_stations), batch)
-        return all_stations
+        """Fetch all station records across all batches."""
+        return await self._fetch_all_batches(STATIONS_URL, "Stations")
 
     async def fetch_all_prices(self) -> list[dict[str, Any]]:
-        """Fetch all fuel price records across all batches.
-
-        Includes a 2-second delay between batches to respect the API rate
-        limit of 30 requests per minute (1 concurrent request).
-        """
-        all_prices: list[dict[str, Any]] = []
-        batch = 1
-        while True:
-            if batch > 1:
-                await asyncio.sleep(2)
-            data = await self._get(PRICES_URL, {"batch-number": batch})
-            prices = data if isinstance(data, list) else data.get("results", data.get("data", []))
-            if not prices:
-                break
-            all_prices.extend(prices)
-            if len(prices) < BATCH_SIZE:
-                break
-            batch += 1
-        _LOGGER.debug("Fetched %d price records across %d batches", len(all_prices), batch)
-        return all_prices
+        """Fetch all fuel price records across all batches."""
+        return await self._fetch_all_batches(PRICES_URL, "Prices")
 
     async def test_connection(self) -> bool:
         """Test that credentials are valid by fetching a token."""
