@@ -1,0 +1,42 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "UK Fuel Prices",
+        "description": "Enter your GOV.UK Fuel Finder API credentials.",
+        "data": {
+          "api_token_id": "Client ID",
+          "api_token_value": "Client Secret",
+          "latitude": "Latitude",
+          "longitude": "Longitude",
+          "radius": "Search radius (miles)",
+          "fuel_type": "Fuel type",
+          "ors_api_key": "OpenRouteService API key (optional)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid credentials",
+      "cannot_connect": "Unable to connect to the API",
+      "unknown": "An unexpected error occurred"
+    },
+    "abort": {
+      "already_configured": "This integration is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "UK Fuel Prices Settings",
+        "description": "Adjust your fuel price monitoring settings.",
+        "data": {
+          "latitude": "Latitude",
+          "longitude": "Longitude",
+          "radius": "Search radius (miles)",
+          "fuel_type": "Fuel type",
+          "ors_api_key": "OpenRouteService API key (optional)"
+        }
+      }
+    }
+  }
+}
