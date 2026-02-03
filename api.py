@@ -163,9 +163,13 @@ class FuelFinderApi:
     ) -> list[dict[str, Any]]:
         """Fetch all records across paginated batches with error resilience.
 
-        Retries individual failed batches and continues fetching remaining
-        batches even if one fails. Includes a 2-second delay between batches
-        to respect the API rate limit of 30 req/min (1 concurrent request).
+        On the initial pass, failed batches are skipped and collected.  After
+        the main loop finishes, any failed batches are retried once (with a
+        longer delay) so the full dataset can be assembled.  This avoids
+        permanent gaps in the cached data.
+
+        Includes a 2-second delay between batches to respect the API rate
+        limit of 30 req/min (1 concurrent request).
 
         Args:
             since: Optional timestamp (YYYY-MM-DD HH:MM:SS) for incremental
@@ -175,6 +179,7 @@ class FuelFinderApi:
         batch = 1
         failed_batches: list[int] = []
         consecutive_empty = 0
+        consecutive_failures = 0
 
         while True:
             if batch > 1:
@@ -203,6 +208,7 @@ class FuelFinderApi:
                     continue
 
                 consecutive_empty = 0
+                consecutive_failures = 0
                 all_records.extend(records)
                 _LOGGER.debug(
                     "%s batch %d: got %d records (total: %d)",
@@ -215,33 +221,73 @@ class FuelFinderApi:
 
             except FuelFinderApiError as err:
                 failed_batches.append(batch)
+                consecutive_failures += 1
                 _LOGGER.warning(
                     "%s batch %d failed: %s — skipping to next batch",
                     label, batch, err,
                 )
-                # Don't stop on a single batch failure; try the next one
-                # but cap at 2 consecutive failures to avoid infinite loops
-                if len(failed_batches) >= 2 and failed_batches[-1] == failed_batches[-2] + 1:
+                # Cap at 3 consecutive failures to avoid hammering a down API
+                if consecutive_failures >= 3:
                     _LOGGER.error(
-                        "%s: two consecutive batch failures (batches %d-%d), stopping",
-                        label, failed_batches[-2], failed_batches[-1],
+                        "%s: %d consecutive batch failures, stopping main pass",
+                        label, consecutive_failures,
                     )
                     break
                 batch += 1
                 continue
 
+        # --- Retry any failed batches once with a longer delay ---
         if failed_batches:
-            _LOGGER.warning(
-                "%s: completed with %d failed batches: %s (got %d records total)",
-                label, len(failed_batches), failed_batches, len(all_records),
+            _LOGGER.info(
+                "%s: retrying %d failed batches: %s",
+                label, len(failed_batches), failed_batches,
             )
+            still_failed: list[int] = []
+            for retry_batch in failed_batches:
+                await asyncio.sleep(5)  # longer delay for retries
+                try:
+                    params = {"batch-number": retry_batch}
+                    if since:
+                        params["effective-start-timestamp"] = since
+                    data = await self._get(url, params)
+                    records = (
+                        data
+                        if isinstance(data, list)
+                        else data.get("results", data.get("data", []))
+                    )
+                    if records:
+                        all_records.extend(records)
+                        _LOGGER.info(
+                            "%s batch %d retry succeeded: got %d records",
+                            label, retry_batch, len(records),
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "%s batch %d retry returned empty", label, retry_batch
+                        )
+                except FuelFinderApiError as err:
+                    still_failed.append(retry_batch)
+                    _LOGGER.warning(
+                        "%s batch %d retry also failed: %s", label, retry_batch, err
+                    )
+
+            if still_failed:
+                _LOGGER.error(
+                    "%s: %d batches failed even after retry: %s (got %d records total)",
+                    label, len(still_failed), still_failed, len(all_records),
+                )
+            else:
+                _LOGGER.info(
+                    "%s: all failed batches recovered on retry (%d records total)",
+                    label, len(all_records),
+                )
         else:
             _LOGGER.debug(
-                "%s: fetched %d records across %d batches",
+                "%s: fetched %d records across %d batches (no failures)",
                 label, len(all_records), batch,
             )
 
-        if not all_records and failed_batches:
+        if not all_records:
             raise FuelFinderApiError(
                 f"Failed to fetch any {label.lower()} — all batches failed"
             )
