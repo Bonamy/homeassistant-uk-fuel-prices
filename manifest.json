@@ -1,11 +1,11 @@
 {
   "domain": "uk_fuel_prices",
   "name": "UK Fuel Prices",
-  "codeowners": [],
+  "codeowners": ["@Bonamy"],
   "config_flow": true,
-  "documentation": "https://github.com/your-repo/uk_fuel_prices",
+  "documentation": "https://github.com/Bonamy/homeassistant-uk-fuel-prices",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/your-repo/uk_fuel_prices/issues",
+  "issue_tracker": "https://github.com/Bonamy/homeassistant-uk-fuel-prices/issues",
   "requirements": [],
-  "version": "1.0.0"
+  "version": "2.0.0"
 }
