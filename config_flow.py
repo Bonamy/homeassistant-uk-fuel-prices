@@ -9,17 +9,18 @@ import aiohttp
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig, SelectSelectorMode
 
 from .api import FuelFinderApi, FuelFinderAuthError, FuelFinderApiError
 from .const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
-    CONF_FUEL_TYPE,
+    CONF_FUEL_TYPES,
     CONF_LATITUDE,
     CONF_LONGITUDE,
     CONF_ORS_API_KEY,
     CONF_RADIUS,
-    DEFAULT_FUEL_TYPE,
+    DEFAULT_FUEL_TYPES,
     DEFAULT_RADIUS,
     DOMAIN,
     FUEL_TYPES,
@@ -40,10 +41,16 @@ async def _validate_credentials(
         await session.close()
 
 
+# Build options list for the multi-select fuel type selector
+_FUEL_TYPE_OPTIONS = [
+    {"value": code, "label": label} for code, label in FUEL_TYPES.items()
+]
+
+
 class UkFuelPricesConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for UK Fuel Prices."""
 
-    VERSION = 1
+    VERSION = 2
 
     @staticmethod
     @callback
@@ -72,25 +79,24 @@ class UkFuelPricesConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected error during config")
                 errors["base"] = "unknown"
             else:
-                # Use HA home zone coordinates as defaults if not provided
                 lat = user_input.get(CONF_LATITUDE) or self.hass.config.latitude
                 lon = user_input.get(CONF_LONGITUDE) or self.hass.config.longitude
 
-                # Use fuel type as unique ID so multiple instances are allowed
-                fuel_type = user_input.get(CONF_FUEL_TYPE, DEFAULT_FUEL_TYPE)
-                await self.async_set_unique_id(fuel_type)
+                # Only allow one instance of this integration
+                await self.async_set_unique_id(DOMAIN)
                 self._abort_if_unique_id_configured()
 
-                fuel_label = FUEL_TYPES.get(fuel_type, fuel_type)
+                fuel_types = user_input.get(CONF_FUEL_TYPES, DEFAULT_FUEL_TYPES)
+
                 return self.async_create_entry(
-                    title=f"UK Fuel Prices — {fuel_label}",
+                    title="UK Fuel Prices",
                     data={
                         CONF_CLIENT_ID: user_input[CONF_CLIENT_ID],
                         CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET],
                         CONF_LATITUDE: lat,
                         CONF_LONGITUDE: lon,
                         CONF_RADIUS: user_input.get(CONF_RADIUS, DEFAULT_RADIUS),
-                        CONF_FUEL_TYPE: user_input.get(CONF_FUEL_TYPE, DEFAULT_FUEL_TYPE),
+                        CONF_FUEL_TYPES: fuel_types,
                         CONF_ORS_API_KEY: user_input.get(CONF_ORS_API_KEY, ""),
                     },
                 )
@@ -107,8 +113,14 @@ class UkFuelPricesConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Optional(CONF_RADIUS, default=DEFAULT_RADIUS): vol.All(
                     vol.Coerce(float), vol.Range(min=1, max=100)
                 ),
-                vol.Optional(CONF_FUEL_TYPE, default=DEFAULT_FUEL_TYPE): vol.In(
-                    FUEL_TYPES
+                vol.Optional(
+                    CONF_FUEL_TYPES, default=DEFAULT_FUEL_TYPES
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=_FUEL_TYPE_OPTIONS,
+                        multiple=True,
+                        mode=SelectSelectorMode.LIST,
+                    )
                 ),
                 vol.Optional(CONF_ORS_API_KEY): str,
             }
@@ -132,18 +144,22 @@ class UkFuelPricesOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         """Manage the options."""
         if user_input is not None:
-            # Merge updated options back into the config entry data
             new_data = {**self._config_entry.data, **user_input}
             self.hass.config_entries.async_update_entry(
                 self._config_entry, data=new_data
             )
-            # Trigger a reload so the coordinator picks up new settings
             await self.hass.config_entries.async_reload(self._config_entry.entry_id)
             return self.async_create_entry(title="", data={})
 
         current = self._config_entry.data
         home_lat = self.hass.config.latitude
         home_lon = self.hass.config.longitude
+
+        # Support legacy single fuel_type config
+        current_fuel_types = current.get(CONF_FUEL_TYPES)
+        if not current_fuel_types:
+            legacy = current.get("fuel_type")
+            current_fuel_types = [legacy] if legacy else DEFAULT_FUEL_TYPES
 
         schema = vol.Schema(
             {
@@ -160,9 +176,15 @@ class UkFuelPricesOptionsFlow(OptionsFlow):
                     default=current.get(CONF_RADIUS, DEFAULT_RADIUS),
                 ): vol.All(vol.Coerce(float), vol.Range(min=1, max=100)),
                 vol.Optional(
-                    CONF_FUEL_TYPE,
-                    default=current.get(CONF_FUEL_TYPE, DEFAULT_FUEL_TYPE),
-                ): vol.In(FUEL_TYPES),
+                    CONF_FUEL_TYPES,
+                    default=current_fuel_types,
+                ): SelectSelector(
+                    SelectSelectorConfig(
+                        options=_FUEL_TYPE_OPTIONS,
+                        multiple=True,
+                        mode=SelectSelectorMode.LIST,
+                    )
+                ),
                 vol.Optional(
                     CONF_ORS_API_KEY,
                     default=current.get(CONF_ORS_API_KEY, ""),

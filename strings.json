@@ -10,7 +10,7 @@
           "latitude": "Latitude",
           "longitude": "Longitude",
           "radius": "Search radius (miles)",
-          "fuel_type": "Fuel type",
+          "fuel_types": "Fuel types",
           "ors_api_key": "OpenRouteService API key (optional)"
         }
       }
@@ -33,7 +33,7 @@
           "latitude": "Latitude",
           "longitude": "Longitude",
           "radius": "Search radius (miles)",
-          "fuel_type": "Fuel type",
+          "fuel_types": "Fuel types",
           "ors_api_key": "OpenRouteService API key (optional)"
         }
       }

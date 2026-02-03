@@ -18,7 +18,7 @@ from .api import (
     get_driving_distances,
     haversine_miles,
 )
-from .const import DEFAULT_SCAN_INTERVAL
+from .const import DEFAULT_SCAN_INTERVAL, fuel_display_labels
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,11 +26,24 @@ _LOGGER = logging.getLogger(__name__)
 class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator to fetch and process fuel price data.
 
-    On the first update a full fetch of all stations and prices is performed.
-    Subsequent updates use the ``effective-start-timestamp`` API parameter to
-    request only records that changed since the last successful fetch, then
-    merge them into the cached data.  This dramatically reduces API calls from
-    ~34 batches down to typically 1-2.
+    Fetches all stations and prices once, then processes them for each
+    selected fuel type.  Subsequent updates use incremental fetching.
+
+    Data structure returned::
+
+        {
+            "fuel_labels": {"E10": "Petrol", "B7_STANDARD": "Diesel"},
+            "by_fuel": {
+                "E10": {
+                    "top3": [...],
+                    "stations": {...},
+                },
+                "B7_STANDARD": {
+                    "top3": [...],
+                    "stations": {...},
+                },
+            },
+        }
     """
 
     def __init__(
@@ -41,7 +54,7 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         home_lat: float,
         home_lon: float,
         radius: float,
-        fuel_type: str,
+        fuel_types: list[str],
         ors_api_key: str | None = None,
     ) -> None:
         super().__init__(
@@ -55,7 +68,7 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._home_lat = home_lat
         self._home_lon = home_lon
         self._radius = radius
-        self._fuel_type = fuel_type
+        self._fuel_types = fuel_types
         self._ors_api_key = ors_api_key
 
         # Cached raw data keyed by node_id for incremental merging
@@ -66,14 +79,13 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._retry_interval = timedelta(minutes=5)
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch station and price data, return all stations and top 3 cheapest."""
+        """Fetch data and process for all selected fuel types."""
         is_incremental = self._last_fetch_time is not None
 
         try:
             stations_raw, prices_raw = await self._fetch_data()
         except FuelFinderApiError as err:
             if is_incremental and self._cached_stations:
-                # Incremental fetch failed but we have cached data — use it
                 _LOGGER.warning(
                     "Incremental fetch failed (%s), using cached data "
                     "(%d stations, %d prices)",
@@ -82,7 +94,6 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 stations_raw = list(self._cached_stations.values())
                 prices_raw = list(self._cached_prices.values())
             else:
-                # Initial full fetch failed — retry in 5 minutes not 2 hours
                 self.update_interval = self._retry_interval
                 _LOGGER.warning(
                     "Initial fetch failed, will retry in %s: %s",
@@ -92,7 +103,6 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Merge into cache
         if is_incremental:
-            # Merge incremental updates into cached data
             updated_stations = 0
             for station in stations_raw:
                 nid = station.get("node_id", "")
@@ -106,16 +116,14 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._cached_prices[nid] = price
                     updated_prices += 1
             _LOGGER.info(
-                "Incremental update for %s: merged %d station updates, "
+                "Incremental update: merged %d station updates, "
                 "%d price updates into cache (%d total stations, %d total prices)",
-                self._fuel_type, updated_stations, updated_prices,
+                updated_stations, updated_prices,
                 len(self._cached_stations), len(self._cached_prices),
             )
-            # Use the full cached dataset for processing
-            all_stations = list(self._cached_stations.values())
-            all_prices = list(self._cached_prices.values())
+            all_stations_raw = list(self._cached_stations.values())
+            all_prices_raw = list(self._cached_prices.values())
         else:
-            # First fetch — populate the cache
             for station in stations_raw:
                 nid = station.get("node_id", "")
                 if nid:
@@ -125,34 +133,72 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if nid:
                     self._cached_prices[nid] = price
             _LOGGER.info(
-                "Full fetch for %s: cached %d stations, %d prices",
-                self._fuel_type, len(self._cached_stations),
-                len(self._cached_prices),
+                "Full fetch: cached %d stations, %d prices",
+                len(self._cached_stations), len(self._cached_prices),
             )
-            all_stations = stations_raw
-            all_prices = prices_raw
+            all_stations_raw = stations_raw
+            all_prices_raw = prices_raw
 
-        # Record the timestamp for next incremental fetch
         self._last_fetch_time = datetime.now(timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
 
-        _LOGGER.info(
-            "Processing data: %d stations, %d price records, fuel_type=%s",
-            len(all_stations), len(all_prices), self._fuel_type,
-        )
+        # Build nearby station lookup (shared across all fuel types)
+        stations_by_id = self._build_station_lookup(all_stations_raw)
 
-        # Build station lookup by node_id
+        # Build display labels for selected fuel types
+        labels = fuel_display_labels(self._fuel_types)
+
+        # Process each fuel type
+        by_fuel: dict[str, dict[str, Any]] = {}
+        for fuel_code in self._fuel_types:
+            by_fuel[fuel_code] = self._process_fuel_type(
+                fuel_code, stations_by_id, all_prices_raw
+            )
+
+        # Optionally enrich top3 with driving distances (all fuel types)
+        if self._ors_api_key:
+            for fuel_code, fuel_data in by_fuel.items():
+                top3 = fuel_data.get("top3", [])
+                if top3:
+                    coords = [(s["latitude"], s["longitude"]) for s in top3]
+                    driving_dists = await get_driving_distances(
+                        self._session,
+                        self._ors_api_key,
+                        (self._home_lat, self._home_lon),
+                        coords,
+                    )
+                    for i, entry in enumerate(top3):
+                        if i < len(driving_dists) and driving_dists[i] is not None:
+                            entry["driving_distance_miles"] = driving_dists[i]
+
+        # Restore normal polling interval after success
+        if self.update_interval != self._normal_interval:
+            _LOGGER.info(
+                "Data loaded successfully, restoring normal %s polling interval",
+                self._normal_interval,
+            )
+            self.update_interval = self._normal_interval
+
+        return {
+            "fuel_labels": labels,
+            "by_fuel": by_fuel,
+        }
+
+    def _build_station_lookup(
+        self, stations_raw: list[dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        """Filter stations by radius and build lookup dict by node_id."""
         stations_by_id: dict[str, dict[str, Any]] = {}
         skipped_closed = 0
         skipped_no_location = 0
         skipped_out_of_range = 0
-        for station in all_stations:
+
+        for station in stations_raw:
             node_id = station.get("node_id", "")
             if not node_id:
                 continue
 
-            # Skip closed stations
             if station.get("permanent_closure") or station.get("temporary_closure"):
                 skipped_closed += 1
                 continue
@@ -197,81 +243,62 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "Station filtering: %d in range, %d closed, %d no location, %d out of range",
             len(stations_by_id), skipped_closed, skipped_no_location, skipped_out_of_range,
         )
+        return stations_by_id
 
-        # Match prices to nearby stations
+    def _process_fuel_type(
+        self,
+        fuel_code: str,
+        stations_by_id: dict[str, dict[str, Any]],
+        prices_raw: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Process prices for a single fuel type against nearby stations."""
         candidates: list[dict[str, Any]] = []
-        matched_stations = 0
-        no_fuel_type_count = 0
-        bad_price_count = 0
-        for price_record in all_prices:
+        matched = 0
+        no_fuel = 0
+        bad_price = 0
+
+        for price_record in prices_raw:
             node_id = price_record.get("node_id", "")
             station = stations_by_id.get(node_id)
             if not station:
                 continue
 
-            # Find the price for our fuel type
             found_fuel = False
             for fp in price_record.get("fuel_prices", []):
-                if fp.get("fuel_type") == self._fuel_type:
+                if fp.get("fuel_type") == fuel_code:
                     found_fuel = True
                     raw_price = fp.get("price")
                     cleaned = clean_price(raw_price)
                     if cleaned is not None:
                         entry = {**station}
                         entry["price"] = cleaned
-                        entry["fuel_type"] = self._fuel_type
+                        entry["fuel_type"] = fuel_code
                         entry["last_update"] = fp.get("price_last_updated", "")
                         candidates.append(entry)
-                        matched_stations += 1
+                        matched += 1
                     else:
-                        bad_price_count += 1
+                        bad_price += 1
                         _LOGGER.debug(
                             "Station %s (%s) had invalid %s price: %s",
                             station.get("station_name"), node_id,
-                            self._fuel_type, raw_price,
+                            fuel_code, raw_price,
                         )
                     break
             if not found_fuel and station:
-                no_fuel_type_count += 1
+                no_fuel += 1
 
-        # Sort by price, then distance as tiebreaker
         candidates.sort(key=lambda x: (x["price"], x["distance_miles"]))
 
         top3 = candidates[:3]
-
-        # Build a dict of matched stations keyed by node_id for per-station sensors
         matched_by_id: dict[str, dict[str, Any]] = {}
         for entry in candidates:
             matched_by_id[entry["node_id"]] = entry
 
-        # Optionally enrich with driving distances
-        if self._ors_api_key and top3:
-            coords = [(s["latitude"], s["longitude"]) for s in top3]
-            driving_dists = await get_driving_distances(
-                self._session,
-                self._ors_api_key,
-                (self._home_lat, self._home_lon),
-                coords,
-            )
-            for i, entry in enumerate(top3):
-                if i < len(driving_dists) and driving_dists[i] is not None:
-                    entry["driving_distance_miles"] = driving_dists[i]
-
         _LOGGER.info(
             "Results for %s: %d stations with valid prices, %d no %s price, "
-            "%d invalid prices, top 3 cheapest selected",
-            self._fuel_type, matched_stations, no_fuel_type_count,
-            self._fuel_type, bad_price_count,
+            "%d invalid prices, top 3 selected",
+            fuel_code, matched, no_fuel, fuel_code, bad_price,
         )
-
-        # Restore normal polling interval after a successful fetch (may have
-        # been shortened to the retry interval after a previous failure).
-        if self.update_interval != self._normal_interval:
-            _LOGGER.info(
-                "Data loaded successfully, restoring normal %s polling interval",
-                self._normal_interval,
-            )
-            self.update_interval = self._normal_interval
 
         return {
             "top3": top3,
@@ -281,17 +308,10 @@ class FuelPricesCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _fetch_data(
         self,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Fetch stations and prices from the API sequentially.
-
-        Uses incremental fetching with ``effective-start-timestamp`` when
-        cached data is available.  The API only allows 1 concurrent request,
-        so we fetch sequentially to avoid throttling.
-        """
+        """Fetch stations and prices from the API sequentially."""
         since = self._last_fetch_time
         if since:
-            _LOGGER.info(
-                "Performing incremental fetch since %s", since
-            )
+            _LOGGER.info("Performing incremental fetch since %s", since)
         else:
             _LOGGER.info("Performing full initial fetch")
         stations = await self._api.fetch_all_stations(since=since)

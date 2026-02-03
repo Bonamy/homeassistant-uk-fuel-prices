@@ -14,10 +14,12 @@ from .const import (
     CONF_CLIENT_ID,
     CONF_CLIENT_SECRET,
     CONF_FUEL_TYPE,
+    CONF_FUEL_TYPES,
     CONF_LATITUDE,
     CONF_LONGITUDE,
     CONF_ORS_API_KEY,
     CONF_RADIUS,
+    DEFAULT_FUEL_TYPES,
     DOMAIN,
 )
 from .coordinator import FuelPricesCoordinator
@@ -37,6 +39,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.data[CONF_CLIENT_SECRET],
     )
 
+    # Support legacy single fuel_type config (v1) alongside new fuel_types list (v2)
+    fuel_types = entry.data.get(CONF_FUEL_TYPES)
+    if not fuel_types:
+        legacy = entry.data.get(CONF_FUEL_TYPE)
+        fuel_types = [legacy] if legacy else DEFAULT_FUEL_TYPES
+
     coordinator = FuelPricesCoordinator(
         hass,
         api,
@@ -44,7 +52,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         home_lat=entry.data[CONF_LATITUDE],
         home_lon=entry.data[CONF_LONGITUDE],
         radius=entry.data[CONF_RADIUS],
-        fuel_type=entry.data[CONF_FUEL_TYPE],
+        fuel_types=fuel_types,
         ors_api_key=entry.data.get(CONF_ORS_API_KEY) or None,
     )
 
