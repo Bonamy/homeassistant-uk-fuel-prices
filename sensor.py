@@ -21,9 +21,9 @@ from .coordinator import FuelPricesCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 RANK_LABELS = {
-    0: "#1 Cheapest",
-    1: "#2 Cheapest",
-    2: "#3 Cheapest",
+    0: "#1",
+    1: "#2",
+    2: "#3",
 }
 
 

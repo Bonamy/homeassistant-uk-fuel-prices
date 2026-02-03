@@ -159,13 +159,17 @@ class FuelFinderApi:
         raise last_error or FuelFinderApiError("Request failed after all retries")
 
     async def _fetch_all_batches(
-        self, url: str, label: str
+        self, url: str, label: str, since: str | None = None
     ) -> list[dict[str, Any]]:
         """Fetch all records across paginated batches with error resilience.
 
         Retries individual failed batches and continues fetching remaining
         batches even if one fails. Includes a 2-second delay between batches
         to respect the API rate limit of 30 req/min (1 concurrent request).
+
+        Args:
+            since: Optional timestamp (YYYY-MM-DD HH:MM:SS) for incremental
+                   fetching via the effective-start-timestamp parameter.
         """
         all_records: list[dict[str, Any]] = []
         batch = 1
@@ -177,7 +181,10 @@ class FuelFinderApi:
                 await asyncio.sleep(2)
 
             try:
-                data = await self._get(url, {"batch-number": batch})
+                params: dict[str, Any] = {"batch-number": batch}
+                if since:
+                    params["effective-start-timestamp"] = since
+                data = await self._get(url, params)
                 records = (
                     data
                     if isinstance(data, list)
@@ -241,13 +248,29 @@ class FuelFinderApi:
 
         return all_records
 
-    async def fetch_all_stations(self) -> list[dict[str, Any]]:
-        """Fetch all station records across all batches."""
-        return await self._fetch_all_batches(STATIONS_URL, "Stations")
+    async def fetch_all_stations(
+        self, since: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Fetch station records across all batches.
 
-    async def fetch_all_prices(self) -> list[dict[str, Any]]:
-        """Fetch all fuel price records across all batches."""
-        return await self._fetch_all_batches(PRICES_URL, "Prices")
+        Args:
+            since: Optional timestamp (YYYY-MM-DD HH:MM:SS) to fetch only
+                   stations updated since that time.
+        """
+        label = "Stations (incremental)" if since else "Stations (full)"
+        return await self._fetch_all_batches(STATIONS_URL, label, since=since)
+
+    async def fetch_all_prices(
+        self, since: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Fetch fuel price records across all batches.
+
+        Args:
+            since: Optional timestamp (YYYY-MM-DD HH:MM:SS) to fetch only
+                   prices updated since that time.
+        """
+        label = "Prices (incremental)" if since else "Prices (full)"
+        return await self._fetch_all_batches(PRICES_URL, label, since=since)
 
     async def test_connection(self) -> bool:
         """Test that credentials are valid by fetching a token."""
